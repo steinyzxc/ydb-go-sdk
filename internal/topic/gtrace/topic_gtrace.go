@@ -717,6 +717,25 @@ func Compose(lhs *trace.Topic, rhs *trace.Topic, opts ...TopicComposeOption) *tr
 		}
 	}
 	{
+		h1 := lhs.OnReaderMessagesDelivered
+		h2 := rhs.OnReaderMessagesDelivered
+		ret.OnReaderMessagesDelivered = func(t trace.TopicReaderMessagesDeliveredInfo) {
+			if options.panicCallback != nil {
+				defer func() {
+					if e := recover(); e != nil {
+						options.panicCallback(e)
+					}
+				}()
+			}
+			if h1 != nil {
+				h1(t)
+			}
+			if h2 != nil {
+				h2(t)
+			}
+		}
+	}
+	{
 		h1 := lhs.OnReaderReadMessages
 		h2 := rhs.OnReaderReadMessages
 		ret.OnReaderReadMessages = func(t trace.TopicReaderReadMessagesStartInfo) func(trace.TopicReaderReadMessagesDoneInfo) {
@@ -1721,6 +1740,13 @@ func onReaderMessagesReceived(t *trace.Topic, t1 trace.TopicReaderMessagesReceiv
 	}
 	fn(t1)
 }
+func onReaderMessagesDelivered(t *trace.Topic, t1 trace.TopicReaderMessagesDeliveredInfo) {
+	fn := t.OnReaderMessagesDelivered
+	if fn == nil {
+		return
+	}
+	fn(t1)
+}
 func onReaderReadMessages(t *trace.Topic, t1 trace.TopicReaderReadMessagesStartInfo) func(trace.TopicReaderReadMessagesDoneInfo) {
 	fn := t.OnReaderReadMessages
 	if fn == nil {
@@ -2317,6 +2343,17 @@ func TopicOnReaderMessagesReceived(t *trace.Topic, c *context.Context, endpoint 
 	p.Consumer = consumer
 	p.MessagesCount = messagesCount
 	onReaderMessagesReceived(t, p)
+}
+// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+func TopicOnReaderMessagesDelivered(t *trace.Topic, c *context.Context, endpoint string, database string, topic string, consumer string, messagesCount int) {
+	var p trace.TopicReaderMessagesDeliveredInfo
+	p.Context = c
+	p.Endpoint = endpoint
+	p.Database = database
+	p.Topic = topic
+	p.Consumer = consumer
+	p.MessagesCount = messagesCount
+	onReaderMessagesDelivered(t, p)
 }
 // Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 func TopicOnReaderReadMessages(t *trace.Topic, c *context.Context, minCount int, maxCount int, freeBufferCapacity int) func(messagesCount int, topic string, partitionID int64, partitionSessionID int64, offsetStart int64, offsetEnd int64, freeBufferCapacity int, _ error) {

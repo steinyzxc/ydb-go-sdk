@@ -50,6 +50,7 @@ func TestStreamListener_MessagesReceivedTrace(t *testing.T) {
 		func(rawtopicreader.PartitionSessionID, error) {},
 		listener.tracer,
 		listener.listenerID,
+		listener.cfg.ReaderInfo,
 	)
 	listener.workers[session.StreamPartitionSessionID] = worker
 
@@ -102,6 +103,9 @@ func TestStreamListener_WorkerCreationAndRouting(t *testing.T) {
 	e := fixenv.New(t)
 	ctx := sf.Context(e)
 	listener := StreamListener(e)
+	listener.cfg.Endpoint = "configured:2135"
+	listener.cfg.Database = "/local"
+	listener.cfg.Consumer = "consumer"
 
 	// Initially no workers should exist
 	require.Empty(t, listener.workers)
@@ -140,6 +144,8 @@ func TestStreamListener_WorkerCreationAndRouting(t *testing.T) {
 
 	// Should have created a worker
 	require.Len(t, listener.workers, 1)
+	worker := listener.workers[100]
+	require.Equal(t, listener.cfg.ReaderInfo, worker.readerInfo)
 
 	// Waiting for add session to internals
 	xtest.WaitChannelClosed(t, handlerCalled)

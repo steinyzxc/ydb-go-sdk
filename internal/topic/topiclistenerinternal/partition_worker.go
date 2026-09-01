@@ -69,6 +69,7 @@ type PartitionWorker struct {
 	// Tracing and logging fields
 	tracer     *trace.Topic
 	listenerID string
+	readerInfo topicreadercommon.ReaderInfo
 
 	messageQueue *xsync.UnboundedChan[unifiedMessage]
 	bgWorker     *background.Worker
@@ -86,6 +87,7 @@ func NewPartitionWorker[T interface {
 	onStopped WorkerStoppedCallback,
 	tracer *trace.Topic,
 	listenerID string,
+	readerInfo topicreadercommon.ReaderInfo,
 ) *PartitionWorker {
 	// Validate required parameters
 	if userHandler == nil {
@@ -101,6 +103,7 @@ func NewPartitionWorker[T interface {
 		onStopped:          onStopped,
 		tracer:             tracer,
 		listenerID:         listenerID,
+		readerInfo:         readerInfo,
 		messageQueue:       xsync.NewUnboundedChan[unifiedMessage](),
 	}
 }
@@ -288,6 +291,15 @@ func (w *PartitionWorker) callUserHandler(
 		"OnReadMessages",
 		messagesCount,
 	)
+	if msg.Batch != nil && messagesCount > 0 {
+		topicreadercommon.TraceMessagesDelivered(
+			ctx,
+			w.tracer,
+			w.readerInfo,
+			w.partitionSession.Topic,
+			messagesCount,
+		)
+	}
 
 	if err := w.userHandler.OnReadMessages(ctx, event); err != nil {
 		handlerErr := xerrors.WithStackTrace(err)

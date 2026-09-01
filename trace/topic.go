@@ -110,6 +110,8 @@ type (
 		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 		OnReaderMessagesReceived func(TopicReaderMessagesReceivedInfo)
 		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+		OnReaderMessagesDelivered func(TopicReaderMessagesDeliveredInfo)
+		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 		OnReaderReadMessages func(TopicReaderReadMessagesStartInfo) func(TopicReaderReadMessagesDoneInfo)
 		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 		OnReaderUnknownGrpcMessage func(OnReadUnknownGrpcMessageInfo)
@@ -316,6 +318,16 @@ type (
 
 	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 	TopicReaderMessagesReceivedInfo struct {
+		Context       *context.Context
+		Endpoint      string
+		Database      string
+		Topic         string
+		Consumer      string
+		MessagesCount int
+	}
+
+	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+	TopicReaderMessagesDeliveredInfo struct {
 		Context       *context.Context
 		Endpoint      string
 		Database      string

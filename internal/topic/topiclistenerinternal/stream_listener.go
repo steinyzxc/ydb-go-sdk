@@ -657,6 +657,7 @@ func (l *streamListener) createWorkerForPartition(session *topicreadercommon.Par
 		l.onWorkerStopped,
 		l.tracer,
 		l.listenerID,
+		l.cfg.ReaderInfo,
 	)
 
 	// Store worker in map
