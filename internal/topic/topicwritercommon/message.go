@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopiccommon"
@@ -71,6 +72,105 @@ type MessageWithDataContent struct {
 	RawBuf              bytes.Buffer
 	Encoders            *MultiEncoder
 	BufUncompressedSize int
+
+	// Timing is shared by copies of a logical message made while routing a
+	// message through a multi-writer. It is intentionally a pointer so child
+	// writers cannot create duplicate processing, send, or ACK samples.
+	Timing                     *MessageTiming
+	ProcessingReadyAtAdmission bool
+	// Clock and CompressionObserver are internal hooks installed by the
+	// logical writer. They are nil on messages that do not collect metrics.
+	Clock               func() time.Time
+	CompressionObserver func(time.Duration)
+}
+
+// MessageTiming stores the timestamps for one logical message. Each method
+// is safe for concurrent calls from the sender and ACK receiver goroutines.
+type MessageTiming struct {
+	mu sync.Mutex
+
+	processingStartedAt time.Time
+	processingFinished  bool
+	firstSentAt         time.Time
+	acknowledged        bool
+}
+
+// EnsureTiming allocates timing state once and returns the shared pointer.
+func (m *MessageWithDataContent) EnsureTiming() *MessageTiming {
+	if m.Timing == nil {
+		m.Timing = &MessageTiming{}
+	}
+
+	return m.Timing
+}
+
+// StartProcessing records the beginning of message preparation once.
+func (t *MessageTiming) StartProcessing(now time.Time) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.processingStartedAt.IsZero() {
+		t.processingStartedAt = now
+	}
+}
+
+// FinishProcessing completes message preparation once and returns its
+// duration. A false result means preparation was not started or was already
+// completed.
+func (t *MessageTiming) FinishProcessing(now time.Time) (time.Duration, bool) {
+	if t == nil {
+		return 0, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.processingStartedAt.IsZero() || t.processingFinished {
+		return 0, false
+	}
+	t.processingFinished = true
+	if now.Before(t.processingStartedAt) {
+		return 0, true
+	}
+
+	return now.Sub(t.processingStartedAt), true
+}
+
+// MarkFirstSend records the first actual transport send once. It is safe to
+// call immediately before every split request send; retries preserve the
+// original timestamp.
+func (t *MessageTiming) MarkFirstSend(now time.Time) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.firstSentAt.IsZero() {
+		t.firstSentAt = now
+	}
+}
+
+// MarkAck completes ACK timing once. ACKs received before any transport send
+// produce no sample.
+func (t *MessageTiming) MarkAck(now time.Time) (time.Duration, bool) {
+	if t == nil {
+		return 0, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.acknowledged || t.firstSentAt.IsZero() {
+		return 0, false
+	}
+	t.acknowledged = true
+	if now.Before(t.firstSentAt) {
+		return 0, true
+	}
+
+	return now.Sub(t.firstSentAt), true
 }
 
 func (m *MessageWithDataContent) GetEncodedBytes(codec rawtopiccommon.Codec) ([]byte, error) {
@@ -129,7 +229,13 @@ func (m *MessageWithDataContent) encodeRawContent(codec rawtopiccommon.Codec) ([
 
 	m.BufEncoded.Reset()
 
-	_, err := m.Encoders.EncodeBytes(codec, &m.BufEncoded, m.RawBuf.Bytes())
+	_, err := m.Encoders.encodeBytesWithTiming(
+		codec,
+		&m.BufEncoded,
+		m.RawBuf.Bytes(),
+		m.now,
+		m.CompressionObserver,
+	)
 	if err != nil {
 		return nil, xerrors.WithStackTrace(xerrors.Wrap(fmt.Errorf(
 			"ydb: failed to compress message, codec '%v': %w",
@@ -169,7 +275,13 @@ func (m *MessageWithDataContent) readDataToTargetCodec(codec rawtopiccommon.Code
 		reader = &bytes.Reader{}
 	}
 
-	bytesCount, err := m.Encoders.Encode(codec, &m.BufEncoded, reader)
+	bytesCount, err := m.Encoders.encodeWithTiming(
+		codec,
+		&m.BufEncoded,
+		reader,
+		m.now,
+		m.CompressionObserver,
+	)
 	if err != nil {
 		return xerrors.WithStackTrace(xerrors.Wrap(fmt.Errorf(
 			"ydb: failed compress message with codec '%v': %w",
@@ -181,6 +293,14 @@ func (m *MessageWithDataContent) readDataToTargetCodec(codec rawtopiccommon.Code
 	m.Data = nil
 
 	return nil
+}
+
+func (m *MessageWithDataContent) now() time.Time {
+	if m.Clock != nil {
+		return m.Clock()
+	}
+
+	return time.Now()
 }
 
 func (m *MessageWithDataContent) getRawBytes() ([]byte, error) {

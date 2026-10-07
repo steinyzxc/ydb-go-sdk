@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync/atomic"
+	"time"
 
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/background"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/empty"
@@ -24,12 +25,13 @@ var errSingleStreamWriterDoubleClose = xerrors.Wrap(errors.New("ydb: single stre
 type SingleStreamWriterConfig struct {
 	WritersCommonConfig
 
-	stream                RawTopicWriterStream
-	queue                 *messageQueue
-	encodersMap           *topicwritercommon.MultiEncoder
-	getLastSeqNum         bool
-	reconnectorInstanceID string
-	endpoint              trace.EndpointInfo
+	stream                 RawTopicWriterStream
+	queue                  *messageQueue
+	encodersMap            *topicwritercommon.MultiEncoder
+	metricDurationObserver func(trace.TopicWriterMetricDurationKind, time.Duration)
+	getLastSeqNum          bool
+	reconnectorInstanceID  string
+	endpoint               trace.EndpointInfo
 }
 
 func newSingleStreamWriterConfig(
@@ -261,7 +263,14 @@ func (w *SingleStreamWriter) sendMessagesFromQueueToStreamLoop(ctx context.Conte
 			return
 		}
 
-		err = sendMessagesToStream(w.cfg.stream, w.cfg.maxBytesPerMessage, targetCodec, messages)
+		err = sendMessagesToStream(
+			w.cfg.stream,
+			w.cfg.maxBytesPerMessage,
+			targetCodec,
+			messages,
+			w.cfg.Now,
+			w.cfg.metricDurationObserver,
+		)
 
 		logCtx := w.cfg.LogContext
 		onSentComplete := gtrace.TopicOnWriterSendMessages(
@@ -336,6 +345,8 @@ func sendMessagesToStream(
 	maxBytesPerMessage int,
 	targetCodec rawtopiccommon.Codec,
 	messages []messageWithDataContent,
+	now func() time.Time,
+	metricDurationObserver func(trace.TopicWriterMetricDurationKind, time.Duration),
 ) error {
 	if len(messages) == 0 {
 		return nil
@@ -345,11 +356,27 @@ func sendMessagesToStream(
 	if err != nil {
 		return err
 	}
+	if metricDurationObserver != nil {
+		finishedAt := now()
+		for i := range messages {
+			if duration, ok := messages[i].Timing.FinishProcessing(finishedAt); ok {
+				metricDurationObserver(trace.TopicWriterMetricDurationProcessing, duration)
+			}
+		}
+	}
 
 	var rest *rawtopicwriter.WriteRequest
+	sentMessages := 0
 	for request != nil {
 		request, rest = cutRequestBytes(request, maxBytesPerMessage)
+		if metricDurationObserver != nil {
+			firstSendAt := now()
+			for i := range request.Messages {
+				messages[sentMessages+i].Timing.MarkFirstSend(firstSendAt)
+			}
+		}
 		err = stream.Send(request)
+		sentMessages += len(request.Messages)
 		if err != nil {
 			return xerrors.WithStackTrace(fmt.Errorf("ydb: failed send write request: %w", err))
 		}

@@ -4,6 +4,7 @@ package gtrace
 
 import (
 	"context"
+	"time"
 
 	"github.com/ydb-platform/ydb-go-genproto/protos/Ydb_Topic"
 	"github.com/ydb-platform/ydb-go-sdk/v3/trace"
@@ -1208,6 +1209,94 @@ func Compose(lhs *trace.Topic, rhs *trace.Topic, opts ...TopicComposeOption) *tr
 		}
 	}
 	{
+		h1 := lhs.OnWriterSendingChanged
+		h2 := rhs.OnWriterSendingChanged
+		ret.OnWriterSendingChanged = func(t trace.TopicWriterSendingChangedInfo) {
+			if options.panicCallback != nil {
+				defer func() {
+					if e := recover(); e != nil {
+						options.panicCallback(e)
+					}
+				}()
+			}
+			if h1 != nil {
+				h1(t)
+			}
+			if h2 != nil {
+				h2(t)
+			}
+		}
+		if h1 == nil && h2 == nil {
+			ret.OnWriterSendingChanged = nil
+		}
+	}
+	{
+		h1 := lhs.OnWriterMessagesWritten
+		h2 := rhs.OnWriterMessagesWritten
+		ret.OnWriterMessagesWritten = func(t trace.TopicWriterMessagesWrittenInfo) {
+			if options.panicCallback != nil {
+				defer func() {
+					if e := recover(); e != nil {
+						options.panicCallback(e)
+					}
+				}()
+			}
+			if h1 != nil {
+				h1(t)
+			}
+			if h2 != nil {
+				h2(t)
+			}
+		}
+		if h1 == nil && h2 == nil {
+			ret.OnWriterMessagesWritten = nil
+		}
+	}
+	{
+		h1 := lhs.OnWriterSessionError
+		h2 := rhs.OnWriterSessionError
+		ret.OnWriterSessionError = func(t trace.TopicWriterSessionErrorInfo) {
+			if options.panicCallback != nil {
+				defer func() {
+					if e := recover(); e != nil {
+						options.panicCallback(e)
+					}
+				}()
+			}
+			if h1 != nil {
+				h1(t)
+			}
+			if h2 != nil {
+				h2(t)
+			}
+		}
+		if h1 == nil && h2 == nil {
+			ret.OnWriterSessionError = nil
+		}
+	}
+	{
+		h1 := lhs.OnWriterMetricDuration
+		h2 := rhs.OnWriterMetricDuration
+		ret.OnWriterMetricDuration = func(t trace.TopicWriterMetricDurationInfo) {
+			if options.panicCallback != nil {
+				defer func() {
+					if e := recover(); e != nil {
+						options.panicCallback(e)
+					}
+				}()
+			}
+			if h1 != nil {
+				h1(t)
+			}
+			if h2 != nil {
+				h2(t)
+			}
+		}
+		if h1 == nil && h2 == nil {
+			ret.OnWriterMetricDuration = nil
+		}
+	}
+	{
 		h1 := lhs.OnWriterSentGRPCMessage
 		h2 := rhs.OnWriterSentGRPCMessage
 		ret.OnWriterSentGRPCMessage = func(t trace.TopicWriterSentGRPCMessageInfo) {
@@ -2073,6 +2162,34 @@ func onWriterReceiveResult(t *trace.Topic, t1 trace.TopicWriterResultMessagesInf
 	}
 	fn(t1)
 }
+func onWriterSendingChanged(t *trace.Topic, t1 trace.TopicWriterSendingChangedInfo) {
+	fn := t.OnWriterSendingChanged
+	if fn == nil {
+		return
+	}
+	fn(t1)
+}
+func onWriterMessagesWritten(t *trace.Topic, t1 trace.TopicWriterMessagesWrittenInfo) {
+	fn := t.OnWriterMessagesWritten
+	if fn == nil {
+		return
+	}
+	fn(t1)
+}
+func onWriterSessionError(t *trace.Topic, t1 trace.TopicWriterSessionErrorInfo) {
+	fn := t.OnWriterSessionError
+	if fn == nil {
+		return
+	}
+	fn(t1)
+}
+func onWriterMetricDuration(t *trace.Topic, t1 trace.TopicWriterMetricDurationInfo) {
+	fn := t.OnWriterMetricDuration
+	if fn == nil {
+		return
+	}
+	fn(t1)
+}
 func onWriterSentGRPCMessage(t *trace.Topic, t1 trace.TopicWriterSentGRPCMessageInfo) {
 	fn := t.OnWriterSentGRPCMessage
 	if fn == nil {
@@ -2770,6 +2887,55 @@ func TopicOnWriterReceiveResult(t *trace.Topic, c *context.Context, writerInstan
 	p.PartitionID = partitionID
 	p.Acks = acks
 	onWriterReceiveResult(t, p)
+}
+// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+func TopicOnWriterSendingChanged(t *trace.Topic, c *context.Context, endpoint string, database string, topic string, writerName string, messagesDelta int64, bytesDelta int64) {
+	var p trace.TopicWriterSendingChangedInfo
+	p.Context = c
+	p.Endpoint = endpoint
+	p.Database = database
+	p.Topic = topic
+	p.WriterName = writerName
+	p.MessagesDelta = messagesDelta
+	p.BytesDelta = bytesDelta
+	onWriterSendingChanged(t, p)
+}
+// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+func TopicOnWriterMessagesWritten(t *trace.Topic, c *context.Context, endpoint string, database string, topic string, writerName string, messagesCount int64) {
+	var p trace.TopicWriterMessagesWrittenInfo
+	p.Context = c
+	p.Endpoint = endpoint
+	p.Database = database
+	p.Topic = topic
+	p.WriterName = writerName
+	p.MessagesCount = messagesCount
+	onWriterMessagesWritten(t, p)
+}
+// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+func TopicOnWriterSessionError(t *trace.Topic, c *context.Context, endpoint string, database string, topic string, writerName string, retryDecision string, statusCode string, errorType string, e error) {
+	var p trace.TopicWriterSessionErrorInfo
+	p.Context = c
+	p.Endpoint = endpoint
+	p.Database = database
+	p.Topic = topic
+	p.WriterName = writerName
+	p.RetryDecision = retryDecision
+	p.StatusCode = statusCode
+	p.ErrorType = errorType
+	p.Error = e
+	onWriterSessionError(t, p)
+}
+// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+func TopicOnWriterMetricDuration(t *trace.Topic, c *context.Context, endpoint string, database string, topic string, writerName string, kind trace.TopicWriterMetricDurationKind, d time.Duration) {
+	var p trace.TopicWriterMetricDurationInfo
+	p.Context = c
+	p.Endpoint = endpoint
+	p.Database = database
+	p.Topic = topic
+	p.WriterName = writerName
+	p.Kind = kind
+	p.Duration = d
+	onWriterMetricDuration(t, p)
 }
 // Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 func TopicOnWriterSentGRPCMessage(t *trace.Topic, c *context.Context, topicStreamInternalID string, sessionID string, messageNumber int, message *Ydb_Topic.StreamWriteMessage_FromClient, e error) {

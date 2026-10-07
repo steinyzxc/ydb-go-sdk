@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xsync"
 	"github.com/ydb-platform/ydb-go-sdk/v3/pkg/xtest"
 	"github.com/ydb-platform/ydb-go-sdk/v3/topic/topictypes"
+	"github.com/ydb-platform/ydb-go-sdk/v3/trace"
 )
 
 var errTest = errors.New("test error")
@@ -283,6 +285,7 @@ func newTestMultiWriterWithAutopartitioningWriter(
 	t testing.TB,
 	describer TopicDescriber,
 	state *stubs.DescribeWithSplitsState,
+	opts ...topicwriterinternal.PublicWriterOption,
 ) *MultiWriter {
 	const producerIDPrefix = "test-producer"
 
@@ -303,6 +306,9 @@ func newTestMultiWriterWithAutopartitioningWriter(
 	topicwriterinternal.WithTopic("test/topic")(writerCfg)
 	topicwriterinternal.WithMaxQueueLen(100)(writerCfg)
 	topicwriterinternal.WithAutosetCreatedTime(false)(writerCfg)
+	for _, opt := range opts {
+		opt(writerCfg)
+	}
 
 	writer, err := NewMultiWriter(describer, writerCfg, &cfg)
 	require.NoError(t, err)
@@ -1125,12 +1131,35 @@ func TestMultiWriter_Write_WithAutopartitioningWriter(t *testing.T) {
 	baseDesc := stubs.DefaultStubTopicDescription(t)
 	state := stubs.NewDescribeWithSplitsState(t, baseDesc, 6) // 6 is first free ID after partitions 1..5
 	stubClient := stubs.NewStubTopicClientWithSplits(t, state)
+	var (
+		admittedMessages atomic.Int64
+		admittedBytes    atomic.Int64
+		writtenMessages  atomic.Int64
+		wrongWriterName  atomic.Bool
+	)
+	tracer := &trace.Topic{
+		OnWriterSendingChanged: func(info trace.TopicWriterSendingChangedInfo) {
+			if info.WriterName != "multi-split-metrics-test" {
+				wrongWriterName.Store(true)
+			}
+			admittedMessages.Add(info.MessagesDelta)
+			admittedBytes.Add(info.BytesDelta)
+		},
+		OnWriterMessagesWritten: func(info trace.TopicWriterMessagesWrittenInfo) {
+			if info.WriterName != "multi-split-metrics-test" {
+				wrongWriterName.Store(true)
+			}
+			writtenMessages.Add(info.MessagesCount)
+		},
+	}
 	multiWriter := newTestMultiWriterWithAutopartitioningWriter(
 		t,
 		func(ctx context.Context, path string) (topictypes.TopicDescription, error) {
 			return stubClient.Describe(ctx, path)
 		},
 		state,
+		topicwriterinternal.WithTrace(tracer),
+		topicwriterinternal.WithWriterName("multi-split-metrics-test"),
 	)
 
 	err := multiWriter.WaitInit(ctx)
@@ -1149,6 +1178,10 @@ func TestMultiWriter_Write_WithAutopartitioningWriter(t *testing.T) {
 
 	require.NoError(t, multiWriter.Write(ctx, messages))
 	require.NoError(t, multiWriter.Close(ctx))
+	require.False(t, wrongWriterName.Load())
+	require.Equal(t, int64(len(messages)), admittedMessages.Load())
+	require.Equal(t, int64(len(messages)*len("hello")), admittedBytes.Load())
+	require.Equal(t, int64(len(messages)), writtenMessages.Load())
 }
 
 func TestMultiWriter_Write_SmallIdleSessionTimeout(t *testing.T) {

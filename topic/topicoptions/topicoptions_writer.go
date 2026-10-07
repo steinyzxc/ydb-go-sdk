@@ -15,6 +15,14 @@ import (
 // WriterOption options for a topic writer
 type WriterOption = topicwriterinternal.PublicWriterOption
 
+// WithWriterName sets the stable name used to identify this logical writer in
+// metrics. If omitted or empty, writer metrics are disabled. The name is
+// shared by all reconnecting or partition child streams created for this
+// writer.
+func WithWriterName(name string) WriterOption {
+	return topicwriterinternal.WithWriterName(name)
+}
+
 // WriteSessionMetadata set key-value metadata for write session.
 // The metadata will allow for messages of the session in topic reader.
 type WriteSessionMetadata map[string]string

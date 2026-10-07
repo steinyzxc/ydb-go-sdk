@@ -73,7 +73,9 @@ func (w *basicWriter) ackProcessor() {
 		if w.ackDelay > 0 {
 			time.Sleep(w.ackDelay)
 		}
-		w.onAckReceivedCallback(ack)
+		if w.onAckReceivedCallback != nil {
+			w.onAckReceivedCallback(ack)
+		}
 	}
 }
 

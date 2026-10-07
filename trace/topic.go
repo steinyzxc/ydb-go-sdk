@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"time"
 
 	"github.com/ydb-platform/ydb-go-genproto/protos/Ydb_Topic"
 )
@@ -163,6 +164,18 @@ type (
 		OnWriterSendMessages func(TopicWriterSendMessagesStartInfo) func(TopicWriterSendMessagesDoneInfo)
 		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 		OnWriterReceiveResult func(TopicWriterResultMessagesInfo)
+		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+		// gtrace:optional
+		OnWriterSendingChanged func(TopicWriterSendingChangedInfo)
+		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+		// gtrace:optional
+		OnWriterMessagesWritten func(TopicWriterMessagesWrittenInfo)
+		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+		// gtrace:optional
+		OnWriterSessionError func(TopicWriterSessionErrorInfo)
+		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+		// gtrace:optional
+		OnWriterMetricDuration func(TopicWriterMetricDurationInfo)
 		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 		OnWriterSentGRPCMessage func(TopicWriterSentGRPCMessageInfo)
 		// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
@@ -724,6 +737,54 @@ type (
 	}
 
 	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+	TopicWriterSendingChangedInfo struct {
+		Context       *context.Context
+		Endpoint      string
+		Database      string
+		Topic         string
+		WriterName    string
+		MessagesDelta int64
+		BytesDelta    int64
+	}
+
+	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+	TopicWriterMessagesWrittenInfo struct {
+		Context       *context.Context
+		Endpoint      string
+		Database      string
+		Topic         string
+		WriterName    string
+		MessagesCount int64
+	}
+
+	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+	TopicWriterSessionErrorInfo struct {
+		Context       *context.Context
+		Endpoint      string
+		Database      string
+		Topic         string
+		WriterName    string
+		RetryDecision string
+		StatusCode    string
+		ErrorType     string
+		Error         error
+	}
+
+	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+	TopicWriterMetricDurationKind string
+
+	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
+	TopicWriterMetricDurationInfo struct {
+		Context    *context.Context
+		Endpoint   string
+		Database   string
+		Topic      string
+		WriterName string
+		Kind       TopicWriterMetricDurationKind
+		Duration   time.Duration
+	}
+
+	// Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals
 	TopicWriterResultMessagesInfoAcks interface {
 		GetAcks() struct {
 			AcksCount        int
@@ -791,6 +852,13 @@ type (
 		SessionID        string
 		Error            error
 	}
+)
+
+const (
+	TopicWriterMetricDurationBufferWait  TopicWriterMetricDurationKind = "buffer.wait"
+	TopicWriterMetricDurationProcessing  TopicWriterMetricDurationKind = "message.processing"
+	TopicWriterMetricDurationCompression TopicWriterMetricDurationKind = "compression"
+	TopicWriterMetricDurationAck         TopicWriterMetricDurationKind = "message.ack"
 )
 
 // Internals: https://github.com/ydb-platform/ydb-go-sdk/blob/master/VERSIONING.md#internals

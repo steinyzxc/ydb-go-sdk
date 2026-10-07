@@ -239,6 +239,7 @@ func NewWriterReconnector(
 func newWriterReconnectorStopped(
 	cfg WriterReconnectorConfig, //nolint:gocritic
 ) *WriterReconnector {
+	cfg.FinalizeWriterInfo()
 	writerInstanceID, _ := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
 	res := &WriterReconnector{
 		cfg:                            cfg,
@@ -253,7 +254,12 @@ func newWriterReconnectorStopped(
 
 	res.queue.OnAckReceived = res.onAckReceived
 	res.queue.AckCallback = res.cfg.OnAckReceivedCallback
-
+	res.queue.Now = cfg.Now
+	if cfg.WriterInfo.WriterName != "" && cfg.Tracer != nil &&
+		!cfg.MultiMode && (cfg.Tracer.OnWriterSendingChanged != nil ||
+		cfg.Tracer.OnWriterMessagesWritten != nil || cfg.Tracer.OnWriterMetricDuration != nil) {
+		res.queue.OnMetricEvent = res.onQueueMetricEvent
+	}
 	for codec, creator := range cfg.AdditionalEncoders {
 		res.encodersMap.AddEncoder(codec, creator)
 	}
@@ -362,13 +368,28 @@ func (w *WriterReconnector) writePrepared(
 	if messageCount == 0 {
 		return nil
 	}
-
 	semaphoreWeight := int64(messageCount)
+	bufferWaitStartedAt, bufferWaitDuration := time.Time{}, time.Duration(0)
+	if w.bufferWaitMetricsEnabled() {
+		bufferWaitStartedAt = w.cfg.Now()
+	}
 	if err := w.acquireQueueSpaceForWrite(ctx, semaphoreWeight); err != nil {
 		return err
 	}
+	if !bufferWaitStartedAt.IsZero() {
+		bufferWaitDuration = w.cfg.Now().Sub(bufferWaitStartedAt)
+		bufferWaitDuration = max(bufferWaitDuration, 0)
+	}
+	emitBufferWait := func() {
+		if bufferWaitStartedAt.IsZero() {
+			return
+		}
+		bufferWaitStartedAt = time.Time{}
+		w.onMetricDuration(trace.TopicWriterMetricDurationBufferWait, bufferWaitDuration)
+	}
 	defer func() {
 		w.semaphore.Release(semaphoreWeight)
+		emitBufferWait()
 	}()
 
 	if err := w.waitFirstInitResponse(ctx); err != nil {
@@ -380,7 +401,13 @@ func (w *WriterReconnector) writePrepared(
 		return err
 	}
 
-	return w.writeCommon(ctx, messages, &semaphoreWeight, preserveAssignedFields)
+	return w.writeCommon(
+		ctx,
+		messages,
+		&semaphoreWeight,
+		preserveAssignedFields,
+		emitBufferWait,
+	)
 }
 
 func (w *WriterReconnector) writeCommon(
@@ -388,6 +415,7 @@ func (w *WriterReconnector) writeCommon(
 	messages []topicwritercommon.MessageWithDataContent,
 	semaphoreWeight *int64,
 	preserveAssignedFields bool,
+	onAdmission func(),
 ) (resErr error) {
 	if err := w.checkMessages(messages); err != nil {
 		return err
@@ -396,6 +424,9 @@ func (w *WriterReconnector) writeCommon(
 	waiter, err := w.addMessageToInternalQueueWithLock(messages, semaphoreWeight, preserveAssignedFields)
 	if err != nil {
 		return err
+	}
+	if onAdmission != nil {
+		onAdmission()
 	}
 	defer func() {
 		if resErr != nil {
@@ -417,6 +448,7 @@ func (w *WriterReconnector) addMessageToInternalQueueWithLock(
 ) (MessageQueueAckWaiter, error) {
 	var (
 		waiter MessageQueueAckWaiter
+		event  topicwritercommon.WriterMetricEvent
 		err    error
 	)
 	w.m.WithLock(func() {
@@ -427,15 +459,18 @@ func (w *WriterReconnector) addMessageToInternalQueueWithLock(
 		}
 
 		if w.cfg.WaitServerAck {
-			waiter, err = w.queue.AddMessagesWithWaiter(messagesSlice)
+			waiter, event, err = w.queue.addMessages(messagesSlice, true)
 		} else {
-			err = w.queue.AddMessages(messagesSlice)
+			_, event, err = w.queue.addMessages(messagesSlice, false)
 		}
 		if err == nil {
 			// move semaphore weight to queue
 			*semaphoreWeight = 0
 		}
 	})
+	// The queue event is captured under its lock; emit it after the writer lock
+	// is released so trace callbacks can re-enter the writer.
+	w.queue.emitMetricEvent(event)
 
 	return waiter, err
 }
@@ -455,6 +490,18 @@ func (w *WriterReconnector) createMessagesWithContent(messages []PublicMessage) 
 	res := make([]messageWithDataContent, 0, len(messages))
 	for i := range messages {
 		mess := newMessageDataWithContent(messages[i], w.encodersMap)
+		if w.metricDurationEnabled() {
+			mess.Timing = &topicwritercommon.MessageTiming{}
+			mess.Clock = w.cfg.Now
+			if w.cfg.Tracer.OnWriterMetricDuration != nil {
+				mess.CompressionObserver = func(duration time.Duration) {
+					w.onMetricDuration(trace.TopicWriterMetricDurationCompression, duration)
+				}
+			}
+			mess.Timing.StartProcessing(w.cfg.Now())
+			mess.ProcessingReadyAtAdmission = w.metricDurationEnabled() &&
+				w.cfg.forceCodec != rawtopiccommon.CodecUNSPECIFIED
+		}
 		res = append(res, mess)
 	}
 
@@ -486,6 +533,11 @@ func (w *WriterReconnector) createMessagesWithContent(messages []PublicMessage) 
 	}
 
 	return res, nil
+}
+
+func (w *WriterReconnector) bufferWaitMetricsEnabled() bool {
+	return !w.cfg.MultiMode && w.cfg.WriterInfo.WriterName != "" && w.cfg.Tracer != nil &&
+		w.cfg.Tracer.OnWriterMetricDuration != nil
 }
 
 func (w *WriterReconnector) Flush(ctx context.Context) error {
@@ -594,12 +646,17 @@ func (w *WriterReconnector) handleReconnectRetry(
 	attempt int,
 	startOfRetries time.Time,
 ) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+
 	retryDuration := w.cfg.clock.Since(startOfRetries)
 	if backoff, stopRetryReason := topic.RetryDecision(
 		reconnectReason,
 		w.retrySettings,
 		retryDuration,
 	); stopRetryReason == nil {
+		w.traceSessionError(ctx, "retry", reconnectReason)
 		delay := backoff.Delay(attempt)
 		delayTimer := w.cfg.clock.NewTimer(delay)
 		select {
@@ -609,15 +666,24 @@ func (w *WriterReconnector) handleReconnectRetry(
 			return true
 		case <-delayTimer.Chan():
 			delayTimer.Stop() // no really need, stop for common style only
-			// pass
 		}
 	} else {
+		w.traceSessionError(ctx, "stop", reconnectReason)
 		_ = w.close(ctx, fmt.Errorf("%w, was retried (%v)", stopRetryReason, retryDuration))
 
 		return true
 	}
 
 	return false
+}
+
+func (w *WriterReconnector) traceSessionError(ctx context.Context, retryDecision string, err error) {
+	if ctx == nil || ctx.Err() != nil || err == nil {
+		return
+	}
+
+	logCtx := w.cfg.LogContext
+	topicwritercommon.TraceSessionError(logCtx, w.cfg.Tracer, w.cfg.WriterInfo, retryDecision, err)
 }
 
 // lookupPartitionLocation looks up which node currently hosts the given partition.
@@ -712,8 +778,16 @@ func (w *WriterReconnector) startWriteStream(ctx context.Context) (writer *Singl
 		w.writerInstanceID,
 		ep,
 	)
+	if w.metricDurationEnabled() {
+		streamCfg.metricDurationObserver = w.onMetricDuration
+	}
 
 	return NewSingleStreamWriter(connectCtx, streamCfg)
+}
+
+func (w *WriterReconnector) metricDurationEnabled() bool {
+	return w.cfg.WriterInfo.WriterName != "" && w.cfg.Tracer != nil &&
+		w.cfg.Tracer.OnWriterMetricDuration != nil
 }
 
 func (w *WriterReconnector) needReceiveLastSeqNo() bool {
@@ -736,6 +810,33 @@ func (w *WriterReconnector) connectWithTimeout(ctx context.Context) (stream RawT
 
 func (w *WriterReconnector) onAckReceived(count int) {
 	w.semaphore.Release(int64(count))
+}
+
+func (w *WriterReconnector) onQueueMetricEvent(event topicwritercommon.WriterMetricEvent) {
+	if w.cfg.MultiMode {
+		return
+	}
+
+	ctx := w.cfg.LogContext
+	info := w.cfg.WriterInfo
+	topicwritercommon.TraceSendingChanged(ctx, w.cfg.Tracer, info, event.MessagesDelta, event.BytesDelta)
+	topicwritercommon.TraceMessagesWritten(ctx, w.cfg.Tracer, info, event.WrittenMessages)
+	for _, duration := range event.Durations {
+		topicwritercommon.TraceMetricDuration(ctx, w.cfg.Tracer, info, duration.Kind, duration.Duration)
+	}
+}
+
+func (w *WriterReconnector) onMetricDuration(
+	kind trace.TopicWriterMetricDurationKind,
+	duration time.Duration,
+) {
+	topicwritercommon.TraceMetricDuration(
+		w.cfg.LogContext,
+		w.cfg.Tracer,
+		w.cfg.WriterInfo,
+		kind,
+		duration,
+	)
 }
 
 func (w *WriterReconnector) onWriterChange(writerStream *SingleStreamWriter) {

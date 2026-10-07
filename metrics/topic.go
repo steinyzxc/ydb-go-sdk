@@ -43,6 +43,7 @@ func topic(config Config) (t trace.Topic) {
 	setupTopicReaderCommitAcknowledged(&t, readerConfig)
 	setupTopicReaderLocalBufferMessages(&t, readerConfig)
 	setupTopicReaderCreditBalanceBytes(&t, readerConfig)
+	setupTopicWriterMetrics(&t, config.WithSystem("topic").WithSystem("writer"))
 
 	return t
 }
@@ -65,7 +66,7 @@ func setupTopicReaderReceivedMessages(t *trace.Topic, config Config) {
 		}
 		addCounter(
 			messages.With(messageLabels(info.Endpoint, info.Database, info.Topic, info.Consumer, info.ReaderName)),
-			info.MessagesCount,
+			int64(info.MessagesCount),
 		)
 	}
 }
@@ -88,7 +89,7 @@ func setupTopicReaderDeliveredMessages(t *trace.Topic, config Config) {
 		}
 		addCounter(
 			deliveredMessages.With(messageLabels(info.Endpoint, info.Database, info.Topic, info.Consumer, info.ReaderName)),
-			info.MessagesCount,
+			int64(info.MessagesCount),
 		)
 	}
 }
@@ -114,7 +115,7 @@ func setupTopicReaderReceivedBytes(t *trace.Topic, config Config) {
 		}
 		addCounterWithAdd(
 			receivedBytes.With(streamLabels(info.Endpoint, info.Database, info.Consumer, info.ReaderName)),
-			info.Bytes,
+			int64(info.Bytes),
 		)
 	}
 }
@@ -161,7 +162,7 @@ func setupTopicReaderCommitQueued(t *trace.Topic, config Config) {
 		}
 		addCounterWithAdd(
 			commitQueued.With(messageLabels(info.Endpoint, info.Database, info.Topic, info.Consumer, info.ReaderName)),
-			info.MessagesCount,
+			int64(info.MessagesCount),
 		)
 	}
 }
@@ -184,7 +185,7 @@ func setupTopicReaderCommitAcknowledged(t *trace.Topic, config Config) {
 		}
 		addCounterWithAdd(
 			commitAcknowledged.With(messageLabels(info.Endpoint, info.Database, info.Topic, info.Consumer, info.ReaderName)),
-			info.MessagesCount,
+			int64(info.MessagesCount),
 		)
 	}
 }
@@ -271,12 +272,12 @@ func streamLabels(endpoint, database, consumer, readerName string) map[string]st
 	}
 }
 
-func addCounter(counter Counter, delta int) {
+func addCounter(counter Counter, delta int64) {
 	if delta <= 0 {
 		return
 	}
 	if adder, ok := counter.(interface{ Add(delta int64) }); ok {
-		adder.Add(int64(delta))
+		adder.Add(delta)
 
 		return
 	}
@@ -285,7 +286,7 @@ func addCounter(counter Counter, delta int) {
 	}
 }
 
-func addCounterWithAdd(counter Counter, delta int) {
+func addCounterWithAdd(counter Counter, delta int64) {
 	if delta <= 0 {
 		return
 	}
@@ -294,7 +295,7 @@ func addCounterWithAdd(counter Counter, delta int) {
 		return
 	}
 
-	adder.Add(int64(delta))
+	adder.Add(delta)
 }
 
 func addGauge(gauge Gauge, delta float64) {

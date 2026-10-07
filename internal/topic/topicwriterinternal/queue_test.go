@@ -16,6 +16,7 @@ import (
 
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/empty"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopicwriter"
+	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicwritercommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xcontext"
 )
 
@@ -499,6 +500,67 @@ func TestQueue_Ack(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, 0, receivedCount)
 	})
+}
+
+func TestMessageQueueCounterOnlyAckDoesNotReadClock(t *testing.T) {
+	q := newMessageQueue()
+	var clockCalls int
+	q.Now = func() time.Time {
+		clockCalls++
+
+		return time.Time{}
+	}
+	var writtenMessages int64
+	q.OnMetricEvent = func(event topicwritercommon.WriterMetricEvent) {
+		writtenMessages += event.WrittenMessages
+	}
+
+	require.NoError(t, q.AddMessages(newTestMessagesWithContent(1)))
+	require.NoError(t, q.AcksReceived([]rawtopicwriter.WriteAck{{SeqNo: 1}}))
+	require.EqualValues(t, 1, writtenMessages)
+	require.Zero(t, clockCalls)
+}
+
+func TestMessageQueue_AckCallbackOrderAcrossConcurrentBatches(t *testing.T) {
+	q := newMessageQueue()
+	require.NoError(t, q.AddMessages(newTestMessagesWithContent(1, 2)))
+
+	firstCallbackStarted := make(chan struct{})
+	releaseFirstCallback := make(chan struct{})
+	callbackLockHeld := make(chan bool, 2)
+	var callbackOrder []int64
+	q.AckCallback = func(seqNo int64) {
+		lockHeld := !q.m.TryLock()
+		if !lockHeld {
+			q.m.Unlock()
+		}
+		callbackLockHeld <- lockHeld
+		if seqNo == 1 {
+			close(firstCallbackStarted)
+			<-releaseFirstCallback
+		}
+		callbackOrder = append(callbackOrder, seqNo)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- q.AcksReceived([]rawtopicwriter.WriteAck{{SeqNo: 1}})
+	}()
+	<-firstCallbackStarted
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- q.AcksReceived([]rawtopicwriter.WriteAck{{SeqNo: 2}})
+	}()
+	<-secondStarted
+	close(releaseFirstCallback)
+
+	require.NoError(t, waitQueueResult(t, firstDone))
+	require.NoError(t, waitQueueResult(t, secondDone))
+	require.Equal(t, []int64{1, 2}, callbackOrder)
+	require.Equal(t, []bool{true, true}, []bool{<-callbackLockHeld, <-callbackLockHeld})
 }
 
 func TestQueue_WaitWokenOnOwnMessageAck(t *testing.T) {

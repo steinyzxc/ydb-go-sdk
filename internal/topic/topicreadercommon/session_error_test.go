@@ -2,7 +2,6 @@ package topicreadercommon
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -19,71 +18,6 @@ import (
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xerrors"
 	"github.com/ydb-platform/ydb-go-sdk/v3/trace"
 )
-
-func TestClassifySessionError(t *testing.T) {
-	tests := []struct {
-		name       string
-		err        error
-		statusCode string
-		errorType  string
-	}{
-		{
-			name:       "transport",
-			err:        grpcStatus.Error(grpcCodes.Unavailable, "connection lost"),
-			statusCode: "Unavailable",
-			errorType:  "transport_error",
-		},
-		{
-			name:       "wrapped transport",
-			err:        xerrors.WithStackTrace(grpcStatus.Error(grpcCodes.DeadlineExceeded, "timeout")),
-			statusCode: "DeadlineExceeded",
-			errorType:  "transport_error",
-		},
-		{
-			name:       "unknown grpc status",
-			err:        grpcStatus.Error(grpcCodes.Code(99), "future transport code"),
-			statusCode: "Code(99)",
-			errorType:  "transport_error",
-		},
-		{
-			name:       "ydb",
-			err:        xerrors.Operation(xerrors.WithStatusCode(Ydb.StatusIds_BAD_SESSION)),
-			statusCode: "BAD_SESSION",
-			errorType:  "ydb_error",
-		},
-		{
-			name:       "unknown ydb status",
-			err:        xerrors.Operation(xerrors.WithStatusCode(Ydb.StatusIds_StatusCode(499999))),
-			statusCode: "499999",
-			errorType:  "ydb_error",
-		},
-		{
-			name:       "unspecified ydb status",
-			err:        xerrors.Operation(xerrors.WithStatusCode(Ydb.StatusIds_STATUS_CODE_UNSPECIFIED)),
-			statusCode: "unknown",
-			errorType:  "ydb_error",
-		},
-		{
-			name:       "generic",
-			err:        errors.New("unexpected failure"),
-			statusCode: "unknown",
-			errorType:  "unknown",
-		},
-		{
-			name:       "nil",
-			statusCode: "unknown",
-			errorType:  "unknown",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := ClassifySessionError(test.err)
-			require.Equal(t, test.statusCode, got.StatusCode)
-			require.Equal(t, test.errorType, got.ErrorType)
-		})
-	}
-}
 
 func TestClassifySessionErrorFromRawTopicStatus(t *testing.T) {
 	for _, test := range []struct {
@@ -127,10 +61,10 @@ func TestClassifySessionErrorFromRawTopicStatus(t *testing.T) {
 			}
 			require.Equal(t, test.backoffType, operationErr.BackoffType())
 
-			classification := ClassifySessionError(fmt.Errorf("outer: %w", err))
-			require.Equal(t, SessionErrorClassification{
+			classification := topic.ClassifySessionError(fmt.Errorf("outer: %w", err))
+			require.Equal(t, topic.SessionErrorClassification{
 				StatusCode: test.statusCode,
-				ErrorType:  ydbSessionErrorType,
+				ErrorType:  "ydb_error",
 			}, classification)
 
 			gotBackoff, gotStop := topic.RetryDecision(
@@ -178,10 +112,10 @@ func TestTraceReaderSessionError(t *testing.T) {
 	require.Equal(t, "Code(99)", got.StatusCode)
 	require.Equal(t, "transport_error", got.ErrorType)
 	require.Same(t, unknownTransportError, got.Error)
-	require.Equal(t, SessionErrorClassification{
+	require.Equal(t, topic.SessionErrorClassification{
 		StatusCode: "Code(99)",
 		ErrorType:  "transport_error",
-	}, ClassifySessionError(unknownTransportError))
+	}, topic.ClassifySessionError(unknownTransportError))
 }
 
 type statusGrpcStream struct {

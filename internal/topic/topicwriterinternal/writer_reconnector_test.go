@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopiccommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopicwriter"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawydb"
+	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicwritercommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xcontext"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xerrors"
@@ -29,6 +31,424 @@ import (
 )
 
 var testCommonEncoders = topicwritercommon.NewMultiEncoder()
+
+type writerMetricErrorReader struct{}
+
+func (writerMetricErrorReader) Read([]byte) (int, error) {
+	return 0, errors.New("writer metric test read error")
+}
+
+type writerMetricClockReader struct {
+	advance  func()
+	reader   *bytes.Reader
+	advanced bool
+}
+
+func (r *writerMetricClockReader) Read(p []byte) (int, error) {
+	if !r.advanced {
+		r.advance()
+		r.advanced = true
+	}
+
+	return r.reader.Read(p)
+}
+
+func TestWriterMetricsTrackAdmissionAndAckCounts(t *testing.T) {
+	type sendingEvent struct {
+		messages int64
+		bytes    int64
+	}
+	type writtenEvent struct {
+		count int64
+	}
+
+	var sending []sendingEvent
+	var written []writtenEvent
+	w := newTestWriterStopped()
+	w.firstConnectionHandled.Store(true)
+	w.cfg.WriterInfo.WriterName = "test-writer"
+	w.cfg.Tracer = &trace.Topic{
+		OnWriterSendingChanged: func(info trace.TopicWriterSendingChangedInfo) {
+			sending = append(sending, sendingEvent{messages: info.MessagesDelta, bytes: info.BytesDelta})
+		},
+		OnWriterMessagesWritten: func(info trace.TopicWriterMessagesWrittenInfo) {
+			written = append(written, writtenEvent{count: info.MessagesCount})
+		},
+	}
+	w.queue.OnMetricEvent = w.onQueueMetricEvent
+
+	ctx := context.Background()
+	require.NoError(t, w.Write(ctx, []PublicMessage{
+		{SeqNo: 1, Data: bytes.NewReader([]byte("abc"))},
+		{SeqNo: 2, Data: bytes.NewReader([]byte("de"))},
+	}))
+	require.Equal(t, []sendingEvent{{messages: 2, bytes: 5}}, sending)
+
+	require.NoError(t, w.queue.AcksReceived([]rawtopicwriter.WriteAck{
+		{
+			SeqNo: 1,
+			MessageWriteStatus: rawtopicwriter.MessageWriteStatus{
+				Type: rawtopicwriter.WriteStatusTypeWrittenInTx,
+			},
+		},
+		{
+			SeqNo: 2,
+			MessageWriteStatus: rawtopicwriter.MessageWriteStatus{
+				Type:          rawtopicwriter.WriteStatusTypeSkipped,
+				SkippedReason: rawtopicwriter.WriteStatusSkipReasonAlreadyWritten,
+			},
+		},
+	}))
+	require.Equal(t, []sendingEvent{
+		{messages: 2, bytes: 5},
+	}, sending)
+	require.Equal(t, []writtenEvent{
+		{count: 2},
+	}, written)
+	writtenBeforeClose := append([]writtenEvent(nil), written...)
+
+	require.NoError(t, w.Write(ctx, []PublicMessage{
+		{SeqNo: 3, Data: bytes.NewReader([]byte("f"))},
+	}))
+	require.NoError(t, w.queue.Close(errors.New("terminal")))
+	require.Equal(t, []sendingEvent{
+		{messages: 2, bytes: 5},
+		{messages: 1, bytes: 1},
+	}, sending)
+	require.Error(t, w.queue.Close(errors.New("second close")))
+	require.Len(t, sending, 2)
+	require.Equal(t, writtenBeforeClose, written)
+}
+
+func TestWriterMetricsDoNotChangeWhenAdmissionFails(t *testing.T) {
+	newInstrumentedWriter := func() (*WriterReconnector, *int64) {
+		var sending int64
+		w := newTestWriterStopped()
+		w.firstConnectionHandled.Store(true)
+		w.cfg.WriterInfo.WriterName = "writer-metrics-admission-failure"
+		w.cfg.Tracer = &trace.Topic{
+			OnWriterSendingChanged: func(info trace.TopicWriterSendingChangedInfo) {
+				sending += info.MessagesDelta
+			},
+		}
+		w.queue.OnMetricEvent = w.onQueueMetricEvent
+
+		return w, &sending
+	}
+
+	t.Run("message size validation", func(t *testing.T) {
+		w, sending := newInstrumentedWriter()
+		w.cfg.MaxMessageSize = 1
+
+		err := w.Write(context.Background(), []PublicMessage{{
+			SeqNo: 1,
+			Data:  bytes.NewReader([]byte("too large")),
+		}})
+		require.Error(t, err)
+		require.Zero(t, *sending)
+		require.Empty(t, w.queue.messagesByOrder)
+	})
+
+	t.Run("serialization", func(t *testing.T) {
+		w, sending := newInstrumentedWriter()
+
+		err := w.Write(context.Background(), []PublicMessage{{
+			SeqNo: 1,
+			Data:  writerMetricErrorReader{},
+		}})
+		require.Error(t, err)
+		require.Zero(t, *sending)
+		require.Empty(t, w.queue.messagesByOrder)
+	})
+
+	t.Run("queue insertion", func(t *testing.T) {
+		w, sending := newInstrumentedWriter()
+		ctx := context.Background()
+
+		require.NoError(t, w.Write(ctx, []PublicMessage{{
+			SeqNo: 1,
+			Data:  bytes.NewReader([]byte("first")),
+		}}))
+		require.EqualValues(t, 1, *sending)
+		err := w.Write(ctx, []PublicMessage{{
+			SeqNo: 1,
+			Data:  bytes.NewReader([]byte("duplicate")),
+		}})
+		require.Error(t, err)
+		require.EqualValues(t, 1, *sending)
+		require.Len(t, w.queue.messagesByOrder, 1)
+	})
+}
+
+func TestWriterProcessingDurationFinishesAtAdmissionForForcedCodec(t *testing.T) {
+	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	clock := clockwork.NewFakeClockAt(start)
+	var durations []trace.TopicWriterMetricDurationInfo
+	tracer := &trace.Topic{
+		OnWriterMetricDuration: func(info trace.TopicWriterMetricDurationInfo) {
+			durations = append(durations, info)
+		},
+	}
+	w := newTestWriterStopped(
+		WithClock(clock),
+		WithWriterName("forced-codec-processing"),
+		WithCodec(rawtopiccommon.CodecGzip),
+		WithTrace(tracer),
+	)
+	w.firstConnectionHandled.Store(true)
+
+	data := &writerMetricClockReader{
+		advance: func() { clock.Advance(5 * time.Second) },
+		reader:  bytes.NewReader([]byte("payload")),
+	}
+	require.NoError(t, w.Write(context.Background(), []PublicMessage{{SeqNo: 1, Data: data}}))
+
+	var processingDurations []time.Duration
+	for _, duration := range durations {
+		if duration.Kind == trace.TopicWriterMetricDurationProcessing {
+			processingDurations = append(processingDurations, duration.Duration)
+		}
+	}
+	require.Equal(t, []time.Duration{5 * time.Second}, processingDurations)
+
+	message := w.queue.messagesByOrder[w.queue.seqNoToOrderID[1]].messageWithDataContent
+	if duration, ok := message.Timing.FinishProcessing(clock.Now().Add(time.Second)); ok {
+		t.Fatalf("processing duration completed again after admission: %v", duration)
+	}
+}
+
+func TestWriterMetricsCountOnlyValidatedAckPrefix(t *testing.T) {
+	var events []topicwritercommon.WriterMetricEvent
+	w := newTestWriterStopped()
+	w.firstConnectionHandled.Store(true)
+	w.queue.OnMetricEvent = func(event topicwritercommon.WriterMetricEvent) {
+		events = append(events, event)
+	}
+
+	require.NoError(t, w.Write(context.Background(), []PublicMessage{
+		{SeqNo: 1, Data: bytes.NewReader([]byte("one"))},
+		{SeqNo: 2, Data: bytes.NewReader([]byte("two"))},
+	}))
+
+	err := w.queue.AcksReceived([]rawtopicwriter.WriteAck{
+		{
+			SeqNo: 1,
+			MessageWriteStatus: rawtopicwriter.MessageWriteStatus{
+				Type: rawtopicwriter.WriteStatusTypeWritten,
+			},
+		},
+		{
+			SeqNo: 99,
+			MessageWriteStatus: rawtopicwriter.MessageWriteStatus{
+				Type: rawtopicwriter.WriteStatusTypeWritten,
+			},
+		},
+	})
+	require.Error(t, err)
+	require.Equal(t, []topicwritercommon.WriterMetricEvent{
+		{MessagesDelta: 2, BytesDelta: 6},
+		{WrittenMessages: 1},
+	}, events)
+	require.Len(t, w.queue.messagesByOrder, 1)
+
+	// A duplicate ACK is rejected without changing any current-value metric.
+	require.Error(t, w.queue.AcksReceived([]rawtopicwriter.WriteAck{{
+		SeqNo: 1,
+		MessageWriteStatus: rawtopicwriter.MessageWriteStatus{
+			Type: rawtopicwriter.WriteStatusTypeWritten,
+		},
+	}}))
+	require.Len(t, events, 2)
+
+	require.NoError(t, w.queue.AcksReceived([]rawtopicwriter.WriteAck{{
+		SeqNo: 2,
+		MessageWriteStatus: rawtopicwriter.MessageWriteStatus{
+			Type: rawtopicwriter.WriteStatusTypeWritten,
+		},
+	}}))
+	require.Equal(t, []topicwritercommon.WriterMetricEvent{
+		{MessagesDelta: 2, BytesDelta: 6},
+		{WrittenMessages: 1},
+		{WrittenMessages: 1},
+	}, events)
+}
+
+func TestWriterMetricsDisabledForUninstrumentedAndMultiWriters(t *testing.T) {
+	regular := newTestWriterStopped()
+	regular.firstConnectionHandled.Store(true)
+	require.Nil(t, regular.queue.OnMetricEvent)
+	require.NoError(t, regular.Write(context.Background(), newTestMessages(1)))
+	require.NoError(t, regular.queue.Close(errors.New("closed")))
+
+	cfg := NewWriterReconnectorConfig(
+		WithTopic("test-topic"),
+		WithAutoSetSeqNo(false),
+		WithWriterName("named-multi-writer"),
+	)
+	cfg.MultiMode = true
+	multiCallbacks := 0
+	cfg.Tracer = &trace.Topic{
+		OnWriterSendingChanged: func(trace.TopicWriterSendingChangedInfo) {
+			multiCallbacks++
+		},
+		OnWriterMessagesWritten: func(trace.TopicWriterMessagesWrittenInfo) {
+			multiCallbacks++
+		},
+	}
+	multi := newWriterReconnectorStopped(cfg)
+	multi.firstConnectionHandled.Store(true)
+	require.Nil(t, multi.queue.OnMetricEvent)
+	require.NoError(t, multi.Write(context.Background(), newTestMessages(1)))
+	require.NoError(t, multi.queue.AcksReceived([]rawtopicwriter.WriteAck{{SeqNo: 1}}))
+	require.NoError(t, multi.queue.Close(errors.New("closed")))
+	require.Zero(t, multiCallbacks)
+}
+
+func TestWriterInfoFinalizationPreservesCustomNamesAndCanonicalTopic(t *testing.T) {
+	const customName = " writer name with spaces "
+	cfg := NewWriterReconnectorConfig(
+		WithTopic("canonical-topic"),
+		WithWriterInfo(topicwritercommon.WriterInfo{
+			Topic:      "metadata-topic-is-ignored",
+			WriterName: customName,
+		}),
+	)
+	w := newWriterReconnectorStopped(cfg)
+	require.Equal(t, customName, w.cfg.WriterInfo.WriterName)
+	require.Equal(t, "canonical-topic", w.cfg.WriterInfo.Topic)
+
+	w1 := newWriterReconnectorStopped(NewWriterReconnectorConfig())
+	w2 := newWriterReconnectorStopped(NewWriterReconnectorConfig())
+	require.Empty(t, w1.cfg.WriterInfo.WriterName)
+	require.Empty(t, w2.cfg.WriterInfo.WriterName)
+}
+
+func TestWriterMetricsCanceledWaitKeepsPendingMessage(t *testing.T) {
+	var events []topicwritercommon.WriterMetricEvent
+	w := newTestWriterStopped()
+	w.firstConnectionHandled.Store(true)
+	w.queue.OnMetricEvent = func(event topicwritercommon.WriterMetricEvent) {
+		events = append(events, event)
+	}
+
+	waiter, err := w.queue.AddMessagesWithWaiter([]messageWithDataContent{
+		newTestMessageWithDataContent(1),
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, w.queue.Wait(ctx, waiter), context.Canceled)
+	require.Len(t, w.queue.messagesByOrder, 1)
+	require.Equal(t, []topicwritercommon.WriterMetricEvent{{MessagesDelta: 1}}, events)
+}
+
+func TestWriterSessionErrorReportsDecisionAndSuppressesCancellation(t *testing.T) {
+	t.Run("retry decision is reported before cancellation", func(t *testing.T) {
+		var events []trace.TopicWriterSessionErrorInfo
+		ctx, cancel := context.WithCancel(context.Background())
+		w := newTestWriterStopped()
+		w.cfg.WriterInfo.WriterName = "test-writer"
+		w.cfg.Tracer = &trace.Topic{
+			OnWriterSessionError: func(info trace.TopicWriterSessionErrorInfo) {
+				events = append(events, info)
+				cancel()
+			},
+		}
+
+		reason := xerrors.Retryable(errors.New("retryable session error"))
+		require.True(t, w.handleReconnectRetry(ctx, reason, 0, w.cfg.clock.Now()))
+		require.Len(t, events, 1)
+		require.Equal(t, "retry", events[0].RetryDecision)
+		require.ErrorIs(t, events[0].Error, reason)
+	})
+
+	t.Run("user stop decision reports original error", func(t *testing.T) {
+		var events []trace.TopicWriterSessionErrorInfo
+		w := newTestWriterStopped()
+		w.cfg.WriterInfo.WriterName = "test-writer"
+		w.cfg.Tracer = &trace.Topic{
+			OnWriterSessionError: func(info trace.TopicWriterSessionErrorInfo) {
+				events = append(events, info)
+			},
+		}
+		w.retrySettings.CheckError = func(topic.PublicCheckErrorRetryArgs) topic.PublicCheckRetryResult {
+			return topic.PublicRetryDecisionStop
+		}
+
+		reason := xerrors.Retryable(errors.New("stopped by callback"))
+		require.True(t, w.handleReconnectRetry(context.Background(), reason, 0, w.cfg.clock.Now()))
+		require.Len(t, events, 1)
+		require.Equal(t, "stop", events[0].RetryDecision)
+		require.ErrorIs(t, events[0].Error, reason)
+	})
+
+	t.Run("intentional cancellation is suppressed", func(t *testing.T) {
+		var events []trace.TopicWriterSessionErrorInfo
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		w := newTestWriterStopped()
+		w.cfg.WriterInfo.WriterName = "test-writer"
+		w.cfg.Tracer = &trace.Topic{
+			OnWriterSessionError: func(info trace.TopicWriterSessionErrorInfo) {
+				events = append(events, info)
+			},
+		}
+
+		reason := xerrors.Retryable(errors.New("intentional close"))
+		require.True(t, w.handleReconnectRetry(ctx, reason, 0, w.cfg.clock.Now()))
+		require.Empty(t, events)
+	})
+}
+
+func TestWriterMetricCallbackCanWriteReentrantly(t *testing.T) {
+	w := newTestWriterStopped()
+	w.firstConnectionHandled.Store(true)
+	w.cfg.WriterInfo.WriterName = "test-writer"
+	ctx := context.Background()
+	var nested bool
+	var nestedErr error
+	w.cfg.Tracer = &trace.Topic{
+		OnWriterSendingChanged: func(info trace.TopicWriterSendingChangedInfo) {
+			if info.MessagesDelta > 0 && !nested {
+				nested = true
+				nestedErr = w.Write(ctx, []PublicMessage{{
+					SeqNo: 2,
+					Data:  bytes.NewReader([]byte("nested")),
+				}})
+			}
+		},
+	}
+	w.queue.OnMetricEvent = w.onQueueMetricEvent
+
+	require.NoError(t, w.Write(ctx, []PublicMessage{{
+		SeqNo: 1,
+		Data:  bytes.NewReader([]byte("outer")),
+	}}))
+	require.NoError(t, nestedErr)
+	require.Len(t, w.queue.messagesByOrder, 2)
+}
+
+func TestWriterProcessingDurationIsForwardedForMultiChild(t *testing.T) {
+	var durations []trace.TopicWriterMetricDurationInfo
+	w := newTestWriterStopped()
+	w.cfg.MultiMode = true
+	w.cfg.WriterInfo.WriterName = "parent-writer"
+	w.cfg.Tracer = &trace.Topic{
+		OnWriterMetricDuration: func(info trace.TopicWriterMetricDurationInfo) {
+			durations = append(durations, info)
+		},
+	}
+
+	w.onMetricDuration(trace.TopicWriterMetricDurationProcessing, 4*time.Second)
+	require.Len(t, durations, 1)
+	require.Equal(t, w.cfg.WriterInfo.Endpoint, durations[0].Endpoint)
+	require.Equal(t, w.cfg.WriterInfo.Database, durations[0].Database)
+	require.Equal(t, w.cfg.WriterInfo.Topic, durations[0].Topic)
+	require.Equal(t, "parent-writer", durations[0].WriterName)
+	require.Equal(t, trace.TopicWriterMetricDurationProcessing, durations[0].Kind)
+	require.Equal(t, 4*time.Second, durations[0].Duration)
+}
 
 func TestWriterImpl_AutoSeq(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {

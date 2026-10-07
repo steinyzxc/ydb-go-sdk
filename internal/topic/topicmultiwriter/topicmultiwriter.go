@@ -27,6 +27,10 @@ func NewMultiWriter(
 	writerCfg *topicwriterinternal.WriterReconnectorConfig,
 	multiWriterCfg *MultiWriterConfig,
 ) (*MultiWriter, error) {
+	// Multi-writer children share one logical writer identity. Finalize it once
+	// before any partition writer configuration is copied.
+	writerCfg.FinalizeWriterInfo()
+
 	if multiWriterCfg.ProducerIDPrefix == "" {
 		multiWriterCfg.ProducerIDPrefix = uuid.NewString()
 	}

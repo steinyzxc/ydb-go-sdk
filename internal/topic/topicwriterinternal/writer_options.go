@@ -199,6 +199,24 @@ func WithTrace(tracer *trace.Topic) PublicWriterOption {
 func WithTopic(topic string) PublicWriterOption {
 	return func(cfg *WriterReconnectorConfig) {
 		cfg.topic = topic
+		cfg.WriterInfo.Topic = topic
+	}
+}
+
+// WithWriterInfo supplies the stable attributes used by writer metrics.
+// It is intended for internal client wiring; public callers should use the
+// individual writer options.
+func WithWriterInfo(info topicwritercommon.WriterInfo) PublicWriterOption {
+	return func(cfg *WriterReconnectorConfig) {
+		cfg.WriterInfo = info
+	}
+}
+
+// WithWriterName sets the stable logical-writer name used by writer metrics.
+// An empty name disables writer metrics.
+func WithWriterName(name string) PublicWriterOption {
+	return func(cfg *WriterReconnectorConfig) {
+		cfg.WriterInfo.WriterName = name
 	}
 }
 

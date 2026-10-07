@@ -17,6 +17,7 @@ import (
 	internalmultiwriter "github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicmultiwriter"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicreadercommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicreaderinternal"
+	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicwritercommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicwriterinternal"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/tx"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xerrors"
@@ -473,10 +474,15 @@ func (c *Client) createWriterConfig(
 	topicPath string,
 	opts []topicoptions.WriterOption,
 ) topicwriterinternal.WriterReconnectorConfig {
-	options := make([]topicwriterinternal.PublicWriterOption, 0, len(opts)+5)
+	options := make([]topicwriterinternal.PublicWriterOption, 0, len(opts)+6)
 	options = append(
 		options,
 		topicwriterinternal.WithRawClient(&c.rawClient),
+		topicwriterinternal.WithWriterInfo(topicwritercommon.WriterInfo{
+			Endpoint: c.cfg.Endpoint,
+			Database: c.writerDatabase(),
+			Topic:    topicPath,
+		}),
 		topicwriterinternal.WithTopic(topicPath),
 		topicwriterinternal.WithCommonConfig(c.cfg.Common),
 		topicwriterinternal.WithTrace(c.cfg.Trace),
@@ -486,4 +492,13 @@ func (c *Client) createWriterConfig(
 	options = append(options, opts...)
 
 	return topicwriterinternal.NewWriterReconnectorConfig(options...)
+}
+
+func (c *Client) writerDatabase() string {
+	database := c.cfg.Database
+	if database != "" {
+		database = path.Clean("/" + database)
+	}
+
+	return database
 }

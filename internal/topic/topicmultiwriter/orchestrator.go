@@ -23,9 +23,9 @@ import (
 )
 
 type orchestrator struct {
-	ctx  context.Context //nolint:containedctx
-	err  error
-	stop context.CancelFunc
+	ctx    context.Context //nolint:containedctx
+	err    error
+	cancel context.CancelFunc
 
 	multiWriterCfg *MultiWriterConfig
 	writerCfg      *topicwriterinternal.WriterReconnectorConfig
@@ -39,7 +39,9 @@ type orchestrator struct {
 
 	currentSeqNo int64
 
-	background *background.Worker
+	background             *background.Worker
+	metricsEnabled         bool
+	metricsDurationEnabled bool
 
 	buf                    *inflightBuffer
 	writerPool             *partitionWriterPool
@@ -75,18 +77,25 @@ func newOrchestrator(
 		mu:               &xsync.Mutex{},
 		topicDescriber:   topicDescriber,
 		ctx:              ctx,
-		stop:             stop,
+		cancel:           stop,
 		partitions:       make(map[int64]*PartitionInfo),
 		initDone:         make(empty.Chan),
 		background:       background,
 		partitionChooser: multiWriterCfg.PartitionChooser,
+		metricsEnabled: writerCfg.WriterInfo.WriterName != "" && writerCfg.Tracer != nil &&
+			(writerCfg.Tracer.OnWriterSendingChanged != nil ||
+				writerCfg.Tracer.OnWriterMessagesWritten != nil ||
+				writerCfg.Tracer.OnWriterMetricDuration != nil),
+		metricsDurationEnabled: writerCfg.WriterInfo.WriterName != "" && writerCfg.Tracer != nil &&
+			writerCfg.Tracer.OnWriterMetricDuration != nil,
 	}
-
 	o.buf = newInflightBuffer(ctx, o.mu, writerCfg, func() error { return o.getResultErr() })
 	o.ackReceiver = newAckReceiver(func(partitionID, seqNo int64) {
+		var event topicwritercommon.WriterMetricEvent
 		o.mu.WithLock(func() {
-			o.onAckReceivedNeedLock(partitionID, seqNo)
+			event = o.onAckReceivedNeedLock(partitionID, seqNo)
 		})
+		o.emitMetricEvent(event)
 	})
 	o.partitionSplitReceiver = newPartitionSplitReceiver(
 		o.onPartitionSplit,
@@ -211,22 +220,18 @@ func (o *orchestrator) choosePartition(msg message) (partitionID int64, err erro
 
 func (o *orchestrator) pushMessage(ctx context.Context, msg message) (err error) {
 	acquired := false
+	var bufferWait time.Duration
 	defer func() {
-		if err != nil && acquired {
-			o.buf.releaseMessage()
-		}
+		o.finishPushMessage(err, acquired, bufferWait)
 	}()
 
 	autoSetSeqNo := o.writerCfg.AutoSetSeqNo
-
-	switch {
-	case !autoSetSeqNo && msg.SeqNo == 0:
-		return ErrNoSeqNo
-	case autoSetSeqNo && msg.SeqNo != 0:
-		return topicwriterinternal.ErrNonZeroSeqNo
+	if err := validateMultiWriterSeqNo(autoSetSeqNo, msg.SeqNo); err != nil {
+		return err
 	}
 
-	if err := o.buf.acquireMessage(ctx); err != nil {
+	bufferWait, err = o.acquireMessageForPush(ctx, &msg)
+	if err != nil {
 		return err
 	}
 	acquired = true
@@ -258,22 +263,140 @@ func (o *orchestrator) pushMessage(ctx context.Context, msg message) (err error)
 	if err := o.saveMessageContent(&msg); err != nil {
 		return err
 	}
+
+	var event topicwritercommon.WriterMetricEvent
 	o.mu.WithLock(func() {
-		if autoSetSeqNo {
-			o.currentSeqNo++
-			msg.SeqNo = o.currentSeqNo
-		} else {
-			err = o.reserveSeqNoNeedLock(msg.PartitionID, msg.SeqNo)
-			if err != nil {
-				return
-			}
+		event, err = o.enqueueMessageNeedLock(&msg, autoSetSeqNo, bufferWait)
+		if err == nil {
+			acquired = false
 		}
-		o.buf.pushNeedLock(msg)
-		o.sender.wakeup()
-		acquired = false
 	})
+	o.emitMetricEvent(event)
 
 	return err
+}
+
+func (o *orchestrator) acquireMessageForPush(
+	ctx context.Context,
+	msg *message,
+) (bufferWait time.Duration, err error) {
+	var startedAt time.Time
+	if o.metricsDurationEnabled {
+		startedAt = o.writerCfg.Now()
+	}
+	if err = o.buf.acquireMessage(ctx); err != nil {
+		return 0, err
+	}
+	if o.metricsDurationEnabled {
+		bufferWait = o.writerCfg.Now().Sub(startedAt)
+	}
+	if o.metricsDurationEnabled {
+		o.configureMessageTiming(msg)
+	}
+
+	return bufferWait, nil
+}
+
+func (o *orchestrator) finishPushMessage(
+	err error,
+	acquired bool,
+	bufferWait time.Duration,
+) {
+	if err != nil && acquired {
+		o.buf.releaseMessage()
+	}
+	if o.metricsDurationEnabled && err != nil && bufferWait >= 0 && acquired {
+		o.emitMetricEvent(topicwritercommon.WriterMetricEvent{
+			Durations: []topicwritercommon.WriterMetricDurationEvent{{
+				Kind:     trace.TopicWriterMetricDurationBufferWait,
+				Duration: bufferWait,
+			}},
+		})
+	}
+}
+
+func validateMultiWriterSeqNo(autoSetSeqNo bool, seqNo int64) error {
+	switch {
+	case !autoSetSeqNo && seqNo == 0:
+		return ErrNoSeqNo
+	case autoSetSeqNo && seqNo != 0:
+		return topicwriterinternal.ErrNonZeroSeqNo
+	default:
+		return nil
+	}
+}
+
+func (o *orchestrator) configureMessageTiming(msg *message) {
+	now := o.writerCfg.Now()
+	msg.Timing = msg.EnsureTiming()
+	msg.Timing.StartProcessing(now)
+	msg.Clock = o.writerCfg.Now
+	if o.writerCfg.Tracer.OnWriterMetricDuration == nil {
+		return
+	}
+	msg.CompressionObserver = func(duration time.Duration) {
+		ctx := o.writerCfg.LogContext
+		if ctx == nil {
+			ctx = o.ctx
+		}
+		topicwritercommon.TraceMetricDuration(
+			ctx,
+			o.writerCfg.Tracer,
+			o.writerCfg.WriterInfo,
+			trace.TopicWriterMetricDurationCompression,
+			duration,
+		)
+	}
+}
+
+func (o *orchestrator) enqueueMessageNeedLock(
+	msg *message,
+	autoSetSeqNo bool,
+	bufferWait time.Duration,
+) (event topicwritercommon.WriterMetricEvent, err error) {
+	if o.ctx.Err() != nil {
+		err = o.err
+		if err == nil {
+			err = ErrAlreadyClosed
+		}
+
+		return event, err
+	}
+	if autoSetSeqNo {
+		o.currentSeqNo++
+		msg.SeqNo = o.currentSeqNo
+	} else {
+		err = o.reserveSeqNoNeedLock(msg.PartitionID, msg.SeqNo)
+		if err != nil {
+			return event, err
+		}
+	}
+
+	if o.metricsEnabled {
+		event = topicwritercommon.WriterMetricEvent{
+			MessagesDelta: 1,
+			BytesDelta:    int64(msg.BufUncompressedSize),
+		}
+	}
+	o.buf.pushNeedLock(*msg)
+	if o.metricsDurationEnabled && o.writerCfg.ForcedCodec() == rawtopiccommon.CodecRaw {
+		processingFinishedAt := o.writerCfg.Now()
+		if duration, ok := msg.Timing.FinishProcessing(processingFinishedAt); ok {
+			event.Durations = append(event.Durations, topicwritercommon.WriterMetricDurationEvent{
+				Kind:     trace.TopicWriterMetricDurationProcessing,
+				Duration: duration,
+			})
+		}
+	}
+	if o.metricsDurationEnabled && bufferWait >= 0 {
+		event.Durations = append(event.Durations, topicwritercommon.WriterMetricDurationEvent{
+			Kind:     trace.TopicWriterMetricDurationBufferWait,
+			Duration: bufferWait,
+		})
+	}
+	o.sender.wakeup()
+
+	return event, nil
 }
 
 func (o *orchestrator) saveMessageContent(msg *message) error {
@@ -304,15 +427,51 @@ func (o *orchestrator) saveMessageContent(msg *message) error {
 	return nil
 }
 
-func (o *orchestrator) onAckReceivedNeedLock(partitionID, seqNo int64) {
+func (o *orchestrator) emitMetricEvent(event topicwritercommon.WriterMetricEvent) {
+	if !o.metricsEnabled || event.IsEmpty() {
+		return
+	}
+
+	ctx := o.writerCfg.LogContext
+	if ctx == nil {
+		ctx = o.ctx
+	}
+	info := o.writerCfg.WriterInfo
+	tracer := o.writerCfg.Tracer
+	topicwritercommon.TraceSendingChanged(
+		ctx,
+		tracer,
+		info,
+		event.MessagesDelta,
+		event.BytesDelta,
+	)
+	topicwritercommon.TraceMessagesWritten(
+		ctx,
+		tracer,
+		info,
+		event.WrittenMessages,
+	)
+	for _, duration := range event.Durations {
+		topicwritercommon.TraceMetricDuration(ctx, tracer, info, duration.Kind, duration.Duration)
+	}
+}
+
+func (o *orchestrator) onAckReceivedNeedLock(partitionID, seqNo int64) topicwritercommon.WriterMetricEvent {
+	if o.ctx.Err() != nil {
+		return topicwritercommon.WriterMetricEvent{}
+	}
+
 	indexChain, ok := o.buf.inFlightMessagesIndex[partitionID]
 	if !ok {
-		return
+		return topicwritercommon.WriterMetricEvent{}
 	}
 
 	message := indexChain.Front()
 	if message == nil {
-		return
+		return topicwritercommon.WriterMetricEvent{}
+	}
+	if message.Value.Value.ackReceived {
+		return topicwritercommon.WriterMetricEvent{}
 	}
 
 	if message.Value.Value.SeqNo != 0 && message.Value.Value.SeqNo != seqNo {
@@ -320,6 +479,18 @@ func (o *orchestrator) onAckReceivedNeedLock(partitionID, seqNo int64) {
 	}
 
 	message.Value.Value.ackReceived = true
+	var event topicwritercommon.WriterMetricEvent
+	if o.metricsEnabled {
+		event = topicwritercommon.WriterMetricEvent{WrittenMessages: 1}
+		if o.metricsDurationEnabled {
+			if ackDuration, ok := message.Value.Value.Timing.MarkAck(o.writerCfg.Now()); ok {
+				event.Durations = append(event.Durations, topicwritercommon.WriterMetricDurationEvent{
+					Kind:     trace.TopicWriterMetricDurationAck,
+					Duration: ackDuration,
+				})
+			}
+		}
+	}
 
 	indexChain.Remove(message)
 	if indexChain.Len() == 0 {
@@ -339,6 +510,8 @@ func (o *orchestrator) onAckReceivedNeedLock(partitionID, seqNo int64) {
 	if len(o.buf.pendingMessagesIndex) > 0 || (partition != nil && partition.PendingResend == 0) {
 		o.sender.wakeup()
 	}
+
+	return event
 }
 
 func (o *orchestrator) getSplittedPartitionAncestors(
@@ -428,10 +601,16 @@ func (o *orchestrator) reserveSeqNoNeedLock(partitionID, seqNo int64) error {
 func (o *orchestrator) scheduleResendMessages(
 	partitionID,
 	maxSeqNo int64,
-) (err error) {
+) (event topicwritercommon.WriterMetricEvent, err error) {
+	select {
+	case <-o.ctx.Done():
+		return event, nil
+	default:
+	}
+
 	inFlightIndexChain, ok := o.buf.inFlightMessagesIndex[partitionID]
 	if !ok {
-		return nil
+		return event, nil
 	}
 
 	var (
@@ -451,13 +630,15 @@ func (o *orchestrator) scheduleResendMessages(
 				continue
 			}
 
-			o.onAckReceivedNeedLock(partitionID, msg.SeqNo)
+			ackEvent := o.onAckReceivedNeedLock(partitionID, msg.SeqNo)
+			event.WrittenMessages += ackEvent.WrittenMessages
+			event.Durations = append(event.Durations, ackEvent.Durations...)
 
 			continue
 		}
 
 		if err := o.rechoosePartition(&msg); err != nil {
-			return err
+			return event, err
 		}
 
 		iter.Value.Value.PartitionID = msg.PartitionID
@@ -493,7 +674,7 @@ func (o *orchestrator) scheduleResendMessages(
 		o.sender.wakeup()
 	}
 
-	return nil
+	return event, nil
 }
 
 func (o *orchestrator) initSeqNo() error {
@@ -675,6 +856,7 @@ func (o *orchestrator) onPartitionSplit(partitionID int64) (resultErr error) {
 	if err != nil {
 		return err
 	}
+	var metricEvent topicwritercommon.WriterMetricEvent
 	o.mu.WithLock(func() {
 		partition := o.partitions[partitionID]
 		if partition == nil {
@@ -683,7 +865,7 @@ func (o *orchestrator) onPartitionSplit(partitionID int64) (resultErr error) {
 			return
 		}
 
-		err = o.scheduleResendMessages(partitionID, maxSeqNo)
+		metricEvent, err = o.scheduleResendMessages(partitionID, maxSeqNo)
 		if err != nil {
 			resultErr = err
 
@@ -699,6 +881,7 @@ func (o *orchestrator) onPartitionSplit(partitionID int64) (resultErr error) {
 			o.writerPool.evict(ancestor)
 		}
 	})
+	o.emitMetricEvent(metricEvent)
 
 	return resultErr
 }
@@ -710,6 +893,12 @@ func (o *orchestrator) getResultErr() error {
 	return o.err
 }
 
+func (o *orchestrator) stop() {
+	o.mu.WithLock(func() {
+		o.cancel()
+	})
+}
+
 func (o *orchestrator) stopWithError(err error) {
 	o.mu.WithLock(func() {
 		if o.ctx.Err() != nil {
@@ -717,7 +906,7 @@ func (o *orchestrator) stopWithError(err error) {
 		}
 
 		o.err = err
-		o.stop()
+		o.cancel()
 	})
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopiccommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/gtrace"
@@ -79,6 +80,19 @@ func (e *MultiEncoder) AddEncoder(codec rawtopiccommon.Codec, creator PublicCrea
 }
 
 func (e *MultiEncoder) Encode(codec rawtopiccommon.Codec, target io.Writer, source io.Reader) (int, error) {
+	return e.encodeWithTiming(codec, target, source, nil, nil)
+}
+
+// encodeWithTiming is the same operation as Encode, but invokes observer only
+// around the actual encoder call. Reading source into the pooled buffer is
+// intentionally outside the measured interval.
+func (e *MultiEncoder) encodeWithTiming(
+	codec rawtopiccommon.Codec,
+	target io.Writer,
+	source io.Reader,
+	clock func() time.Time,
+	observer func(time.Duration),
+) (int, error) {
 	buf := e.bp.GetOrNew()
 	defer e.bp.Put(buf)
 
@@ -87,18 +101,43 @@ func (e *MultiEncoder) Encode(codec rawtopiccommon.Codec, target io.Writer, sour
 		return 0, err
 	}
 
-	return e.EncodeBytes(codec, target, buf.Bytes())
+	if observer == nil {
+		return e.EncodeBytes(codec, target, buf.Bytes())
+	}
+	if clock == nil {
+		clock = time.Now
+	}
+
+	return e.encodeBytesWithTiming(codec, target, buf.Bytes(), clock, observer)
 }
 
 func (e *MultiEncoder) EncodeBytes(codec rawtopiccommon.Codec, target io.Writer, data []byte) (int, error) {
+	return e.encodeBytesWithTiming(codec, target, data, nil, nil)
+}
+
+func (e *MultiEncoder) encodeBytesWithTiming(
+	codec rawtopiccommon.Codec,
+	target io.Writer,
+	data []byte,
+	clock func() time.Time,
+	observer func(time.Duration),
+) (int, error) {
 	enc, err := e.createEncodeWriter(codec, target)
 	if err != nil {
 		return 0, err
 	}
 
+	var startedAt time.Time
+	if observer != nil {
+		startedAt = clock()
+	}
 	n, err := enc.Write(data)
 	if err == nil {
 		err = enc.Close()
+	}
+	if observer != nil {
+		duration := max(clock().Sub(startedAt), 0)
+		observer(duration)
 	}
 	if err != nil {
 		return 0, err

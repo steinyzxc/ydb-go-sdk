@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/empty"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopicwriter"
+	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicwritercommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xerrors"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/xsync"
+	"github.com/ydb-platform/ydb-go-sdk/v3/trace"
 )
 
 var (
@@ -32,6 +35,8 @@ const (
 type messageQueue struct {
 	OnAckReceived func(count int)
 	AckCallback   func(seqNo int64)
+	OnMetricEvent func(topicwritercommon.WriterMetricEvent)
+	Now           func() time.Time
 
 	hasNewMessages empty.Chan
 	closedErr      error
@@ -66,7 +71,8 @@ func newMessageQueue() messageQueue {
 }
 
 func (q *messageQueue) AddMessages(messages []messageWithDataContent) error {
-	_, err := q.addMessages(messages, false)
+	_, event, err := q.addMessages(messages, false)
+	q.emitMetricEvent(event)
 
 	return err
 }
@@ -75,24 +81,28 @@ func (q *messageQueue) AddMessagesWithWaiter(messages []messageWithDataContent) 
 	waiter MessageQueueAckWaiter,
 	err error,
 ) {
-	return q.addMessages(messages, true)
+	waiter, event, err := q.addMessages(messages, true)
+	q.emitMetricEvent(event)
+
+	return waiter, err
 }
 
 func (q *messageQueue) addMessages(messages []messageWithDataContent, needWaiter bool) (
 	waiter MessageQueueAckWaiter,
+	event topicwritercommon.WriterMetricEvent,
 	err error,
 ) {
 	q.m.Lock()
 	defer q.m.Unlock()
 
 	if q.stopReceiveMessagesReason != nil {
-		return waiter, xerrors.WithStackTrace(
+		return waiter, event, xerrors.WithStackTrace(
 			fmt.Errorf("ydb: add message to closed message queue: %w", q.stopReceiveMessagesReason),
 		)
 	}
 
-	if err := q.checkNewMessagesBeforeAddNeedLock(messages); err != nil {
-		return waiter, err
+	if err = q.checkNewMessagesBeforeAddNeedLock(messages); err != nil {
+		return waiter, event, err
 	}
 
 	for i := range messages {
@@ -103,9 +113,34 @@ func (q *messageQueue) addMessages(messages []messageWithDataContent, needWaiter
 		}
 	}
 
+	if q.OnMetricEvent != nil {
+		var bytesCount int64
+		for i := range messages {
+			bytesCount += int64(messages[i].BufUncompressedSize)
+		}
+		event = topicwritercommon.WriterMetricEvent{
+			MessagesDelta: int64(len(messages)),
+			BytesDelta:    bytesCount,
+		}
+		var processingFinishedAt time.Time
+		for i := range messages {
+			if !messages[i].ProcessingReadyAtAdmission {
+				continue
+			}
+			if processingFinishedAt.IsZero() {
+				processingFinishedAt = q.now()
+			}
+			if duration, ok := messages[i].Timing.FinishProcessing(processingFinishedAt); ok {
+				event.Durations = append(event.Durations, topicwritercommon.WriterMetricDurationEvent{
+					Kind:     trace.TopicWriterMetricDurationProcessing,
+					Duration: duration,
+				})
+			}
+		}
+	}
 	q.notifyNewMessages()
 
-	return waiter, nil
+	return waiter, event, nil
 }
 
 func (q *messageQueue) notifyNewMessages() {
@@ -154,38 +189,62 @@ func (q *messageQueue) addMessageNeedLock(
 }
 
 func (q *messageQueue) AcksReceived(acks []rawtopicwriter.WriteAck) error {
-	ackReceivedCounter := 0
-	q.m.Lock()
-	defer func() {
-		q.m.Unlock()
+	ackReceivedCounter, event, err := q.acksReceived(acks)
 
-		if q.OnAckReceived != nil {
-			q.OnAckReceived(ackReceivedCounter)
-		}
-	}()
+	if q.OnAckReceived != nil {
+		q.OnAckReceived(ackReceivedCounter)
+	}
+	q.emitMetricEvent(event)
+
+	return err
+}
+
+func (q *messageQueue) acksReceived(
+	acks []rawtopicwriter.WriteAck,
+) (ackReceivedCounter int, event topicwritercommon.WriterMetricEvent, err error) {
+	q.m.Lock()
+	defer q.m.Unlock()
+
 	if q.closed {
-		return xerrors.WithStackTrace(errAckOnClosedMessageQueue)
+		return 0, event, xerrors.WithStackTrace(errAckOnClosedMessageQueue)
 	}
 
 	for i := range acks {
-		if err := q.ackReceivedNeedLock(acks[i].SeqNo); err != nil {
-			return err
+		message, ackErr := q.ackReceivedNeedLock(acks[i].SeqNo)
+		if ackErr != nil {
+			return ackReceivedCounter, event, ackErr
 		}
 
+		if q.OnMetricEvent != nil {
+			event.WrittenMessages++
+			if message.Timing != nil {
+				if duration, ok := message.Timing.MarkAck(q.now()); ok {
+					event.Durations = append(event.Durations, topicwritercommon.WriterMetricDurationEvent{
+						Kind:     trace.TopicWriterMetricDurationAck,
+						Duration: duration,
+					})
+				}
+			}
+		}
+
+		// AckCallback enqueues ACKs for the multiwriter orchestrator, whose
+		// in-flight messages must be processed in the same order as the queue.
+		// Keep it under q.m so concurrent stream ACK batches cannot overtake.
 		if q.AckCallback != nil {
 			q.AckCallback(acks[i].SeqNo)
 		}
 		ackReceivedCounter++
 	}
 
-	return nil
+	return ackReceivedCounter, event, nil
 }
 
-func (q *messageQueue) ackReceivedNeedLock(seqNo int64) error {
+func (q *messageQueue) ackReceivedNeedLock(seqNo int64) (messageWithDataContent, error) {
 	orderID, ok := q.seqNoToOrderID[seqNo]
 	if !ok {
-		return xerrors.WithStackTrace(errAckUnexpectedMessage)
+		return messageWithDataContent{}, xerrors.WithStackTrace(errAckUnexpectedMessage)
 	}
+	message := q.messagesByOrder[orderID]
 
 	if acked := q.messagesByOrder[orderID].acked; acked != nil {
 		close(acked)
@@ -193,7 +252,7 @@ func (q *messageQueue) ackReceivedNeedLock(seqNo int64) error {
 	delete(q.seqNoToOrderID, seqNo)
 	delete(q.messagesByOrder, orderID)
 
-	return nil
+	return message.messageWithDataContent, nil
 }
 
 func (q *messageQueue) StopAddNewMessages(reason error) {
@@ -234,6 +293,20 @@ func (q *messageQueue) Close(err error) error {
 	close(q.closedChan)
 
 	return nil
+}
+
+func (q *messageQueue) emitMetricEvent(event topicwritercommon.WriterMetricEvent) {
+	if q.OnMetricEvent != nil && !event.IsEmpty() {
+		q.OnMetricEvent(event)
+	}
+}
+
+func (q *messageQueue) now() time.Time {
+	if q.Now != nil {
+		return q.Now()
+	}
+
+	return time.Now()
 }
 
 func (q *messageQueue) ensureNoSmallIntIndexes() {

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -66,7 +67,13 @@ func TestTopicReaderMetricDescriptorsAndLegacyNames(t *testing.T) {
 		require.Equal(t, metric.kind, legacyRegistry.kinds[metric.legacyName], metric.legacyName)
 		require.Equal(t, metric.labels, legacyRegistry.labelNames[metric.legacyName], metric.legacyName)
 	}
-	require.Len(t, capture.units, len(expected))
+	readerDescriptorCount := 0
+	for name := range capture.units {
+		if strings.HasPrefix(name, "ydb.topic.reader.") {
+			readerDescriptorCount++
+		}
+	}
+	require.Equal(t, len(expected), readerDescriptorCount)
 	require.NotContains(t, legacyRegistry.kinds, "custom.topic.reader.credit_balance.bytes")
 }
 
@@ -465,6 +472,7 @@ func labelNameSetFromValues(labels map[string]string) map[string]struct{} {
 type topicCounterCapture struct {
 	units map[string]string
 	adds  map[string][]int64
+	incs  map[string]int
 }
 
 type topicAddCounterConfig struct {
@@ -528,6 +536,55 @@ func (c topicAddCounter) Add(delta int64) {
 	}
 	c.capture.adds[c.path] = append(c.capture.adds[c.path], delta)
 	c.registry.add(c.path, c.labels, float64(delta))
+}
+
+type topicFallbackCounterConfig struct {
+	recordingConfig
+
+	capture *topicCounterCapture
+}
+
+func (c topicFallbackCounterConfig) WithSystem(system string) Config {
+	scoped := c.recordingConfig.WithSystem(system).(recordingConfig)
+
+	return topicFallbackCounterConfig{recordingConfig: scoped, capture: c.capture}
+}
+
+func (c topicFallbackCounterConfig) CounterVec(name string, labels ...string) CounterVec {
+	path := c.path(name)
+	c.registry.register(path, "counter", labels)
+
+	return topicFallbackCounterVec{registry: c.registry, path: path, capture: c.capture}
+}
+
+type topicFallbackCounterVec struct {
+	registry *recordingRegistry
+	path     string
+
+	capture *topicCounterCapture
+}
+
+func (v topicFallbackCounterVec) With(labels map[string]string) Counter {
+	return topicFallbackCounter{registry: v.registry, path: v.path, labels: labels, capture: v.capture}
+}
+
+type topicFallbackCounter struct {
+	registry *recordingRegistry
+	path     string
+	labels   map[string]string
+
+	capture *topicCounterCapture
+}
+
+func (c topicFallbackCounter) Inc() {
+	if c.path == "topic.reader.commit.queued" || c.path == "topic.reader.commit.acknowledged" {
+		panic("commit counter unexpectedly used Inc")
+	}
+	if c.capture.incs == nil {
+		c.capture.incs = make(map[string]int)
+	}
+	c.capture.incs[c.path]++
+	c.registry.add(c.path, c.labels, 1)
 }
 
 type topicGaugeCapture struct {

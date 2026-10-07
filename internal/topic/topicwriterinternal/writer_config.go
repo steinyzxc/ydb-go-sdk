@@ -10,10 +10,12 @@ import (
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopiccommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/internal/grpcwrapper/rawtopic/rawtopicwriter"
+	"github.com/ydb-platform/ydb-go-sdk/v3/internal/topic/topicwritercommon"
 	"github.com/ydb-platform/ydb-go-sdk/v3/trace"
 )
 
 type WritersCommonConfig struct {
+	WriterInfo         topicwritercommon.WriterInfo
 	producerID         string
 	topic              string
 	writerMeta         map[string]string
@@ -28,6 +30,13 @@ type WritersCommonConfig struct {
 	credUpdateInterval time.Duration
 	clock              clockwork.Clock
 	forceCodec         rawtopiccommon.Codec
+}
+
+// FinalizeWriterInfo fills the canonical topic in the stable logical-writer
+// attributes. An empty writer name intentionally remains empty, which disables
+// writer metrics.
+func (c *WritersCommonConfig) FinalizeWriterInfo() {
+	c.WriterInfo.Topic = c.topic
 }
 
 func (c *WritersCommonConfig) Topic() string {
@@ -50,4 +59,9 @@ func (c *WritersCommonConfig) ProducerID() string {
 
 func (c *WritersCommonConfig) Now() time.Time {
 	return c.clock.Now()
+}
+
+// ForcedCodec returns the codec selected for every message when auto-selection is disabled.
+func (c *WritersCommonConfig) ForcedCodec() rawtopiccommon.Codec {
+	return c.forceCodec
 }
